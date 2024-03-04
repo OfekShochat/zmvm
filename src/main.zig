@@ -8,6 +8,8 @@ const Options = struct {
     path: []const u8 = "/home/ghostway/.zigup/",
     pubkey: []const u8 = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     index: []const u8 = "https://ziglang.org/download/index.json",
+    zls_index: []const u8 = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json",
+    zls_giturl: []const u8 = "https://github.com/zigtools/zls/archive/",
     arch: []const u8 = "x86_64-linux",
     zls: bool = false,
 };
@@ -117,6 +119,7 @@ fn checksum(path: []const u8, shasum: []const u8) !void {
 }
 
 const VersionInfo = struct {
+    name: []const u8,
     url: []const u8,
     shasum: []const u8,
 };
@@ -134,7 +137,13 @@ fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, option
     const url = try allocator.dupe(u8, arch_specific.object.get("tarball").?.string);
     const shasum = try allocator.dupe(u8, arch_specific.object.get("shasum").?.string);
 
+    const version_name = if (std.mem.eql(u8, version, "master"))
+        try allocator.dupe(u8, version_specific.object.get("version").?.string)
+    else
+        version;
+
     return VersionInfo{
+        .name = version_name,
         .url = url,
         .shasum = shasum,
     };
@@ -169,6 +178,111 @@ fn isCached(allocator: std.mem.Allocator, options: Options, version: []const u8)
     std.fs.accessAbsolute(path) catch return false;
 
     return true;
+}
+
+fn getZlsVersionInfo(client: *std.http.Client, version: []const u8, options: Options) !VersionInfo {
+    var result = try client.fetch(client.allocator, .{ .location = .{ .url = options.zls_index } });
+    defer result.deinit();
+
+    const index = try std.json.parseFromSlice(std.json.Value, client.allocator, result.body orelse return error.ExpectedIndex, .{});
+    defer index.deinit();
+
+    const versions = index.value.object.get("versions").?;
+
+    var install_version = version;
+
+    if (!versions.object.contains(version)) {
+        const yes_or_no = try getUserYesOrNo("couldn't find zls version for {s}. install latest? [y/n]: ", .{version});
+        if (yes_or_no == .yes) {
+            install_version = index.value.object.get("latest").?.string;
+        } else {
+            return error.NoVersion;
+        }
+    }
+
+    const version_specific = versions.object.get(install_version) orelse return error.InvalidVersion;
+
+    const shasum = try client.allocator.dupe(u8, version_specific.object.get("commit").?.string);
+
+    const url = try std.mem.join(client.allocator, "", &.{
+        options.zls_giturl,
+        "/",
+        shasum,
+        ".tar.gz",
+    });
+
+    return VersionInfo{
+        .name = version,
+        .url = url,
+        .shasum = shasum,
+    };
+}
+
+fn installZls(client: *std.http.Client, version: []const u8, out_path: []const u8, options: Options) !void {
+    const version_info = try getZlsVersionInfo(client, version, options);
+
+    const path = try std.fs.path.join(client.allocator, &.{
+        options.path,
+        "cache",
+        std.fs.path.basename(version_info.url),
+    });
+
+    try downloadToFile(client, version_info.url, path);
+
+    const full_out_path = try std.fs.path.join(client.allocator, &.{
+        out_path,
+        "zls-source",
+    });
+
+    try std.fs.cwd().makeDir(full_out_path);
+
+    var process = std.ChildProcess.init(&.{
+        "tar",
+        "-xf",
+        path,
+        "-C",
+        full_out_path,
+        "--strip-components=1",
+    }, client.allocator);
+
+    try process.spawn();
+
+    const exit_status = getExitCode(try process.wait());
+    if (exit_status != 0) {
+        std.debug.print("exited with status {}.\n", .{exit_status});
+        return error.ExtractingFailed;
+    } else {
+        std.debug.print("done.\n", .{});
+    }
+
+    try std.os.chdir(full_out_path);
+
+    const zig_bin_path = try std.fs.path.join(client.allocator, &.{
+        out_path,
+        "zig",
+    });
+
+    process = std.ChildProcess.init(&.{
+        zig_bin_path,
+        "build",
+        "-Doptimize=ReleaseFast",
+    }, client.allocator);
+
+    _ = try process.spawnAndWait();
+
+    const zls_path = try std.fs.path.join(client.allocator, &.{
+        out_path,
+        "zls",
+    });
+
+    const zls_bin_path = try std.mem.join(client.allocator, "/", &.{
+        full_out_path,
+        "zig-out",
+        "bin",
+        "zls",
+    });
+
+    try std.os.symlink(zls_bin_path, zls_path);
 }
 
 fn installVersion(allocator: std.mem.Allocator, options: Options, version: []const u8) !void {
@@ -226,10 +340,17 @@ fn installVersion(allocator: std.mem.Allocator, options: Options, version: []con
     } else {
         std.debug.print("done.\n", .{});
     }
+
+    if (options.zls) {
+        try installZls(&client, version_info.name, out_path, options);
+    }
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    // some functions are leaky.
+    const allocator = arena.allocator();
+    defer arena.deinit();
 
     var options = Options{};
 
@@ -277,7 +398,7 @@ pub fn main() !void {
 
             const version_info = try getVersionInfo(&client, allocator, options, version);
 
-            const path = try std.fs.path.join(allocator, &.{ options.path, version_info.shasum });
+            const path = try std.fs.path.join(allocator, &.{ options.path, "versions", version_info.shasum });
             defer allocator.free(path);
 
             const dir = try std.fs.cwd().openDir(options.path, .{});
