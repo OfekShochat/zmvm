@@ -3,16 +3,67 @@ const builtin = @import("builtin");
 
 const chunk_size = 1024;
 
-// Read this from file
+const default_pubkey = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+const default_index = "https://ziglang.org/download/index.json";
+const default_zls_index = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json";
+const default_zls_giturl = "https://github.com/zigtools/zls/";
+
 const Options = struct {
-    path: []const u8 = "/home/ghostway/.zigup/",
-    pubkey: []const u8 = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
-    index: []const u8 = "https://ziglang.org/download/index.json",
-    zls_index: []const u8 = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json",
-    zls_giturl: []const u8 = "https://github.com/zigtools/zls/archive/",
-    arch: []const u8 = "x86_64-linux",
-    zls: bool = false,
+    pubkey: []const u8,
+    index: []const u8,
+    zls_index: []const u8,
+    zls_giturl: []const u8,
+    arch: []const u8,
 };
+
+fn getUserOrDefault(
+    comptime fmt: []const u8,
+    args: anytype,
+    allocator: std.mem.Allocator,
+    default: []const u8,
+) ![]const u8 {
+    const stdin = std.io.getStdIn().reader();
+
+    std.debug.print(fmt, args);
+    const input = try stdin.readUntilDelimiterAlloc(allocator, '\n', 1024);
+
+    if (input.len == 0) {
+        allocator.free(input);
+        return allocator.dupe(u8, default);
+    }
+
+    return input;
+}
+
+fn buildOptions(allocator: std.mem.Allocator) !Options {
+    const basepath = try getUserOrDefault("basepath: ", .{}, allocator, "");
+    if (basepath.len == 0) return error.InvalidBasepath;
+
+    const pubkey = try getUserOrDefault("Non-standard pubkey (press enter for default): ", .{}, allocator, default_pubkey);
+    const arch = try getUserOrDefault("Arch [x86_64-linux, x86_64-windows, ...]: ", .{}, allocator, "");
+    if (arch.len == 0) return error.InvalidArch;
+
+    const index = try getUserOrDefault("index url (enter for default): ", .{}, allocator, default_index);
+    const zls_index = try getUserOrDefault("zls index url (enter for default): ", .{}, allocator, default_zls_index);
+    const zls_giturl = try getUserOrDefault("zls git url (enter for default): ", .{}, allocator, default_zls_giturl);
+
+    const config_path = try std.mem.join(allocator, "/", &.{ basepath, "config.json" });
+
+    var file = try std.fs.cwd().createFile(config_path, .{});
+    defer file.close();
+
+    const options = Options{
+        .pubkey = pubkey,
+        .arch = arch,
+        .index = index,
+        .zls_index = zls_index,
+        .zls_giturl = zls_giturl,
+    };
+
+    try std.json.stringify(options, .{}, file.writer());
+
+    return options;
+}
 
 fn getExitCode(term: std.ChildProcess.Term) u32 {
     return switch (term) {
@@ -22,14 +73,6 @@ fn getExitCode(term: std.ChildProcess.Term) u32 {
         .Unknown => |exit_code| exit_code,
     };
 }
-
-const Cmd = union(enum) {
-    clean: void,
-    help: void,
-    install: []const u8,
-    use: []const u8,
-    setup: void,
-};
 
 fn getUserYesOrNo(comptime fmt: []const u8, args: anytype) !enum { yes, no } {
     const stdin = std.io.getStdIn().reader();
@@ -67,10 +110,29 @@ fn downloadToFile(client: *std.http.Client, url: []const u8, out_path: []const u
     var file = try std.fs.cwd().createFile(out_path, .{});
     defer file.close();
 
-    _ = try client.fetch(client.allocator, .{
-        .location = .{ .url = url },
-        .response_strategy = .{ .file = file },
+    var storage = std.ArrayList(u8).init(client.allocator);
+    defer storage.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+
+    var req = try client.open(.GET, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .redirect_behavior = @enumFromInt(3),
+        .headers = .{},
+        .extra_headers = &.{},
+        .privileged_headers = &.{},
+        .keep_alive = true,
     });
+    defer req.deinit();
+
+    try req.send(.{ .raw_uri = false });
+
+    try req.finish();
+    try req.wait();
+
+    var fifo = std.fifo.LinearFifo(u8, .{ .Static = 8192 }).init();
+    try fifo.pump(req.reader(), file.writer());
 
     std.debug.print(" done.\n", .{});
 }
@@ -114,7 +176,7 @@ fn checksum(path: []const u8, shasum: []const u8) !void {
     try fifo.pump(file.reader(), hasher.writer());
 
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(&hasher.finalResult(), .lower), shasum)) {
-        return error.ChecksumFail;
+        return error.ChecksumMismatch;
     }
 }
 
@@ -125,10 +187,13 @@ const VersionInfo = struct {
 };
 
 fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, options: Options, version: []const u8) !VersionInfo {
-    var result = try client.fetch(allocator, .{ .location = .{ .url = options.index } });
-    defer result.deinit();
+    var body = std.ArrayList(u8).init(allocator);
+    _ = try client.fetch(.{
+        .location = .{ .url = options.index },
+        .response_storage = .{ .dynamic = &body },
+    });
 
-    const index = try std.json.parseFromSlice(std.json.Value, allocator, result.body orelse return error.ExpectedIndex, .{});
+    const index = try std.json.parseFromSlice(std.json.Value, allocator, body.items, .{});
     defer index.deinit();
 
     const version_specific = index.value.object.get(version) orelse return error.InvalidVersion;
@@ -149,13 +214,16 @@ fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, option
     };
 }
 
-fn isInstalled(allocator: std.mem.Allocator, options: Options, version: []const u8) !bool {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
+fn isInstalled(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    options: Options,
+    basepath: []const u8,
+    version: []const u8,
+) !bool {
+    const version_info = try getVersionInfo(client, allocator, options, version);
 
-    const version_info = try getVersionInfo(&client, allocator, options, version);
-
-    const out_path = try std.fs.path.join(allocator, &.{ options.path, "versions", version_info.shasum });
+    const out_path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
     defer allocator.free(out_path);
 
     _ = std.fs.cwd().openDir(out_path, .{}) catch return false;
@@ -163,14 +231,19 @@ fn isInstalled(allocator: std.mem.Allocator, options: Options, version: []const 
     return true;
 }
 
-fn isCached(allocator: std.mem.Allocator, options: Options, version: []const u8) !bool {
+fn isCached(
+    allocator: std.mem.Allocator,
+    options: Options,
+    basepath: []const u8,
+    version: []const u8,
+) !bool {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
     const version_info = try getVersionInfo(&client, allocator, options, version);
 
     const path = try std.fs.path.join(allocator, &.{
-        options.path,
+        basepath,
         "cache",
         std.fs.path.basename(version_info.url),
     });
@@ -181,10 +254,15 @@ fn isCached(allocator: std.mem.Allocator, options: Options, version: []const u8)
 }
 
 fn getZlsVersionInfo(client: *std.http.Client, version: []const u8, options: Options) !VersionInfo {
-    var result = try client.fetch(client.allocator, .{ .location = .{ .url = options.zls_index } });
-    defer result.deinit();
+    var body = std.ArrayList(u8).init(client.allocator);
+    defer body.deinit();
 
-    const index = try std.json.parseFromSlice(std.json.Value, client.allocator, result.body orelse return error.ExpectedIndex, .{});
+    _ = try client.fetch(.{
+        .location = .{ .url = options.zls_index },
+        .response_storage = .{ .dynamic = &body },
+    });
+
+    const index = try std.json.parseFromSlice(std.json.Value, client.allocator, body.items, .{});
     defer index.deinit();
 
     const versions = index.value.object.get("versions").?;
@@ -206,7 +284,7 @@ fn getZlsVersionInfo(client: *std.http.Client, version: []const u8, options: Opt
 
     const url = try std.mem.join(client.allocator, "", &.{
         options.zls_giturl,
-        "/",
+        "/archive/",
         shasum,
         ".tar.gz",
     });
@@ -218,11 +296,17 @@ fn getZlsVersionInfo(client: *std.http.Client, version: []const u8, options: Opt
     };
 }
 
-fn installZls(client: *std.http.Client, version: []const u8, out_path: []const u8, options: Options) !void {
+fn installZls(
+    client: *std.http.Client,
+    version: []const u8,
+    basepath: []const u8,
+    out_path: []const u8,
+    options: Options,
+) !void {
     const version_info = try getZlsVersionInfo(client, version, options);
 
     const path = try std.fs.path.join(client.allocator, &.{
-        options.path,
+        basepath,
         "cache",
         std.fs.path.basename(version_info.url),
     });
@@ -255,7 +339,7 @@ fn installZls(client: *std.http.Client, version: []const u8, out_path: []const u
         std.debug.print("done.\n", .{});
     }
 
-    try std.os.chdir(full_out_path);
+    try std.posix.chdir(full_out_path);
 
     const zig_bin_path = try std.fs.path.join(client.allocator, &.{
         out_path,
@@ -282,24 +366,28 @@ fn installZls(client: *std.http.Client, version: []const u8, out_path: []const u
         "zls",
     });
 
-    try std.os.symlink(zls_bin_path, zls_path);
+    try std.posix.symlink(zls_bin_path, zls_path);
 }
 
-fn installVersion(allocator: std.mem.Allocator, options: Options, version: []const u8) !void {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const version_info = try getVersionInfo(&client, allocator, options, version);
+fn installVersion(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    options: Options,
+    version: []const u8,
+    basepath: []const u8,
+    install_zls: bool,
+) !void {
+    const version_info = try getVersionInfo(client, allocator, options, version);
 
     const path = try std.fs.path.join(allocator, &.{
-        options.path,
+        basepath,
         "cache",
         std.fs.path.basename(version_info.url),
     });
 
     defer allocator.free(path);
 
-    try downloadToFile(&client, version_info.url, path);
+    try downloadToFile(client, version_info.url, path);
 
     try checksum(path, version_info.shasum);
     std.debug.print("hooray: checksums match! ({s})\n", .{version_info.shasum});
@@ -309,10 +397,10 @@ fn installVersion(allocator: std.mem.Allocator, options: Options, version: []con
     defer allocator.free(sig_url);
     defer allocator.free(sig_path);
 
-    try downloadToFile(&client, sig_url, sig_path);
+    try downloadToFile(client, sig_url, sig_path);
     try verifySignature(allocator, path, sig_path, options);
 
-    const out_path = try std.fs.path.join(allocator, &.{ options.path, "versions", version_info.shasum });
+    const out_path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
     defer allocator.free(out_path);
 
     std.fs.cwd().deleteTree(out_path) catch {};
@@ -341,10 +429,18 @@ fn installVersion(allocator: std.mem.Allocator, options: Options, version: []con
         std.debug.print("done.\n", .{});
     }
 
-    if (options.zls) {
-        try installZls(&client, version_info.name, out_path, options);
+    if (install_zls) {
+        try installZls(client, version_info.name, basepath, out_path, options);
     }
 }
+
+const Cmd = union(enum) {
+    clean: void,
+    help: void,
+    install: []const u8,
+    use: []const u8,
+    setup: void,
+};
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -352,22 +448,33 @@ pub fn main() !void {
     const allocator = arena.allocator();
     defer arena.deinit();
 
-    var options = Options{};
+    const basepath = try std.process.getEnvVarOwned(allocator, "ZIGUP_BASEDIR");
+    defer allocator.free(basepath);
+
+    if (basepath.len == 0) return error.InvalidEnvSetup;
+
+    const config_path = try std.mem.join(allocator, "/", &.{ basepath, "config.json" });
+    defer allocator.free(config_path);
+
+    const options = blk: {
+        const s = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 32) catch {
+            const options = try buildOptions(allocator);
+            break :blk options;
+        };
+
+        break :blk (try std.json.parseFromSlice(Options, allocator, s, .{})).value;
+    };
 
     var iter = try std.process.ArgIterator.initWithAllocator(allocator);
     defer iter.deinit();
 
     var cmd: Cmd = .help;
 
+    var install_zls = false;
+
     while (iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--basepath")) {
-            options.path = iter.next() orelse return error.ExpectedArgumentValue;
-        } else if (std.mem.eql(u8, arg, "--pubkey")) {
-            options.pubkey = iter.next() orelse return error.ExpectedArgumentValue;
-        } else if (std.mem.eql(u8, arg, "--index")) {
-            options.index = iter.next() orelse return error.ExpectedArgumentValue;
-        } else if (std.mem.eql(u8, arg, "-zls")) {
-            options.zls = true;
+        if (std.mem.eql(u8, arg, "-zls")) {
+            install_zls = true;
         } else if (std.mem.eql(u8, arg, "install")) {
             cmd = .{ .install = iter.next() orelse return error.ExpectedArgumentValue };
         } else if (std.mem.eql(u8, arg, "use")) {
@@ -383,31 +490,36 @@ pub fn main() !void {
 
     switch (cmd) {
         .setup => {
-            const dir = try std.fs.cwd().openDir(options.path, .{});
+            const dir = try std.fs.cwd().openDir(basepath, .{});
             try dir.makeDir("cache");
             try dir.makeDir("versions");
         },
-        .install => |version| try installVersion(allocator, options, version),
-        .use => |version| {
-            if (!try isInstalled(allocator, options, version)) {
-                try installVersion(allocator, options, version);
-            }
-
+        .install => |version| {
             var client = std.http.Client{ .allocator = allocator };
             defer client.deinit();
 
+            try installVersion(&client, allocator, options, version, basepath, install_zls);
+        },
+        .use => |version| {
+            var client = std.http.Client{ .allocator = allocator };
+            defer client.deinit();
+
+            if (!try isInstalled(&client, allocator, options, basepath, version)) {
+                try installVersion(&client, allocator, options, version, basepath, install_zls);
+            }
+
             const version_info = try getVersionInfo(&client, allocator, options, version);
 
-            const path = try std.fs.path.join(allocator, &.{ options.path, "versions", version_info.shasum });
+            const path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
             defer allocator.free(path);
 
-            const dir = try std.fs.cwd().openDir(options.path, .{});
+            const dir = try std.fs.cwd().openDir(basepath, .{});
 
             dir.deleteFile("current") catch {};
             try dir.symLink(path, "current", .{});
         },
         .clean => {
-            const dir = try std.fs.cwd().openDir(options.path, .{});
+            const dir = try std.fs.cwd().openDir(basepath, .{});
 
             dir.deleteFile("current") catch {};
             dir.deleteTree("cache") catch {};
@@ -415,7 +527,10 @@ pub fn main() !void {
             dir.deleteTree("versions") catch {};
             try dir.makeDir("versions");
         },
-        else => {},
-        // .help =>
+        .help => std.debug.print(
+            \\  Zigup - The minimal zig version manager.
+            \\    [use, install, setup, help, clean] [-zls, ...]
+            \\
+        , .{}),
     }
 }
