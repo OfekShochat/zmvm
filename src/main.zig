@@ -187,6 +187,8 @@ const VersionInfo = struct {
 };
 
 fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, options: Options, version: []const u8) !VersionInfo {
+    std.debug.print("debug: fetching version info from index...", .{});
+
     var body = std.ArrayList(u8).init(allocator);
     _ = try client.fetch(.{
         .location = .{ .url = options.index },
@@ -207,6 +209,8 @@ fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, option
     else
         version;
 
+    std.debug.print(" done.\n", .{});
+
     return VersionInfo{
         .name = version_name,
         .url = url,
@@ -215,40 +219,14 @@ fn getVersionInfo(client: *std.http.Client, allocator: std.mem.Allocator, option
 }
 
 fn isInstalled(
-    client: *std.http.Client,
     allocator: std.mem.Allocator,
-    options: Options,
+    version_info: VersionInfo,
     basepath: []const u8,
-    version: []const u8,
 ) !bool {
-    const version_info = try getVersionInfo(client, allocator, options, version);
-
     const out_path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
     defer allocator.free(out_path);
 
     _ = std.fs.cwd().openDir(out_path, .{}) catch return false;
-
-    return true;
-}
-
-fn isCached(
-    allocator: std.mem.Allocator,
-    options: Options,
-    basepath: []const u8,
-    version: []const u8,
-) !bool {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const version_info = try getVersionInfo(&client, allocator, options, version);
-
-    const path = try std.fs.path.join(allocator, &.{
-        basepath,
-        "cache",
-        std.fs.path.basename(version_info.url),
-    });
-
-    std.fs.accessAbsolute(path) catch return false;
 
     return true;
 }
@@ -373,12 +351,10 @@ fn installVersion(
     client: *std.http.Client,
     allocator: std.mem.Allocator,
     options: Options,
-    version: []const u8,
+    version_info: VersionInfo,
     basepath: []const u8,
     install_zls: bool,
 ) !void {
-    const version_info = try getVersionInfo(client, allocator, options, version);
-
     const path = try std.fs.path.join(allocator, &.{
         basepath,
         "cache",
@@ -434,16 +410,34 @@ fn installVersion(
     }
 }
 
+fn isCurrentlyUsed(allocator: std.mem.Allocator, version_info: VersionInfo, basepath: []const u8) !bool {
+    var buf: [256]u8 = undefined;
+
+    const bin_path = try std.fs.path.join(allocator, &.{
+        basepath,
+        "current",
+    });
+
+    defer allocator.free(bin_path);
+
+    const version_path = try std.fs.cwd().readLink(bin_path, &buf);
+
+    return std.mem.eql(u8, std.fs.path.basename(version_path), version_info.shasum);
+}
+
 const Cmd = union(enum) {
     clean: void,
     help: void,
     install: []const u8,
     use: []const u8,
     setup: void,
+    delete: []const u8,
 };
 
+// TODO: move stuff out of main. catch and report better
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator()); // std.heap.page_allocator
     // some functions are leaky.
     const allocator = arena.allocator();
     defer arena.deinit();
@@ -458,6 +452,7 @@ pub fn main() !void {
 
     const options = blk: {
         const s = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 32) catch {
+            std.debug.print("couldn't find config.json at {}. let's build it\n", .{basepath});
             const options = try buildOptions(allocator);
             break :blk options;
         };
@@ -485,6 +480,8 @@ pub fn main() !void {
             cmd = .setup;
         } else if (std.mem.eql(u8, arg, "help")) {
             cmd = .help;
+        } else if (std.mem.eql(u8, arg, "delete")) {
+            cmd = .{ .delete = iter.next() orelse return error.ExpectedArgumentValue };
         }
     }
 
@@ -494,21 +491,59 @@ pub fn main() !void {
             try dir.makeDir("cache");
             try dir.makeDir("versions");
         },
+        .delete => |version| {
+            var client = std.http.Client{ .allocator = allocator };
+            defer client.deinit();
+
+            const version_info = try getVersionInfo(&client, allocator, options, version);
+
+            if (try isCurrentlyUsed(allocator, version_info, basepath) and
+                try getUserYesOrNo("bin path will be invalidated. continue? [y/n]: ", .{}) == .no)
+            {
+                return;
+            }
+
+            const path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
+            defer allocator.free(path);
+
+            try std.fs.cwd().deleteTree(path);
+
+            const cache_path = try std.fs.path.join(allocator, &.{
+                basepath,
+                "cache",
+                std.fs.path.basename(version_info.url),
+            });
+            defer allocator.free(cache_path);
+
+            if (try getUserYesOrNo("delete cache entry? [y/n]: ", .{}) == .yes) {
+                std.fs.cwd().deleteFile(cache_path) catch {};
+            }
+
+            if (try getUserYesOrNo("delete signature entry? [y/n]: ", .{}) == .yes) {
+                const sig_path = try std.mem.join(allocator, ".", &.{ cache_path, "minisig" });
+
+                defer allocator.free(sig_path);
+
+                std.fs.cwd().deleteFile(sig_path) catch {};
+            }
+        },
         .install => |version| {
             var client = std.http.Client{ .allocator = allocator };
             defer client.deinit();
 
-            try installVersion(&client, allocator, options, version, basepath, install_zls);
+            const version_info = try getVersionInfo(&client, allocator, options, version);
+
+            try installVersion(&client, allocator, options, version_info, basepath, install_zls);
         },
         .use => |version| {
             var client = std.http.Client{ .allocator = allocator };
             defer client.deinit();
 
-            if (!try isInstalled(&client, allocator, options, basepath, version)) {
-                try installVersion(&client, allocator, options, version, basepath, install_zls);
-            }
-
             const version_info = try getVersionInfo(&client, allocator, options, version);
+
+            if (!try isInstalled(allocator, version_info, basepath)) {
+                try installVersion(&client, allocator, options, version_info, basepath, install_zls);
+            }
 
             const path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
             defer allocator.free(path);
