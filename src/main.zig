@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const chunk_size = 1024;
-
 const default_pubkey = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
 const default_index = "https://ziglang.org/download/index.json";
 const default_zls_index = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json";
@@ -389,9 +387,6 @@ fn installVersion(
     try std.fs.cwd().makeDir(out_path);
     std.debug.print("info: extracting... ", .{});
 
-    // not always tar
-    // extract();
-
     var process = std.ChildProcess.init(&.{
         "tar",
         "-xf",
@@ -578,8 +573,7 @@ fn driver(allocator: std.mem.Allocator) !void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator()); // std.heap.page_allocator
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
     // some functions are leaky.
     const allocator = arena.allocator();
