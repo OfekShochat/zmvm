@@ -8,6 +8,12 @@ const default_index = "https://ziglang.org/download/index.json";
 const default_zls_index = "https://zigtools-releases.nyc3.digitaloceanspaces.com/zls/index.json";
 const default_zls_giturl = "https://github.com/zigtools/zls/";
 
+const help_string =
+    \\  Zigup - The minimal zig version manager.
+    \\    [use, install, setup, help, clean] [-zls, ...]
+    \\
+;
+
 const Options = struct {
     pubkey: []const u8,
     index: []const u8,
@@ -37,11 +43,11 @@ fn getUserOrDefault(
 
 fn buildOptions(allocator: std.mem.Allocator) !Options {
     const basepath = try getUserOrDefault("basepath: ", .{}, allocator, "");
-    if (basepath.len == 0) return error.InvalidBasepath;
+    if (basepath.len == 0) return error.InvalidInput;
 
     const pubkey = try getUserOrDefault("Non-standard pubkey (press enter for default): ", .{}, allocator, default_pubkey);
     const arch = try getUserOrDefault("Arch [x86_64-linux, x86_64-windows, ...]: ", .{}, allocator, "");
-    if (arch.len == 0) return error.InvalidArch;
+    if (arch.len == 0) return error.InvalidInput;
 
     const index = try getUserOrDefault("index url (enter for default): ", .{}, allocator, default_index);
     const zls_index = try getUserOrDefault("zls index url (enter for default): ", .{}, allocator, default_zls_index);
@@ -434,32 +440,7 @@ const Cmd = union(enum) {
     delete: []const u8,
 };
 
-// TODO: move stuff out of main. catch and report better
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator()); // std.heap.page_allocator
-    // some functions are leaky.
-    const allocator = arena.allocator();
-    defer arena.deinit();
-
-    const basepath = try std.process.getEnvVarOwned(allocator, "ZIGUP_BASEDIR");
-    defer allocator.free(basepath);
-
-    if (basepath.len == 0) return error.InvalidEnvSetup;
-
-    const config_path = try std.mem.join(allocator, "/", &.{ basepath, "config.json" });
-    defer allocator.free(config_path);
-
-    const options = blk: {
-        const s = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 32) catch {
-            std.debug.print("couldn't find config.json at {}. let's build it\n", .{basepath});
-            const options = try buildOptions(allocator);
-            break :blk options;
-        };
-
-        break :blk (try std.json.parseFromSlice(Options, allocator, s, .{})).value;
-    };
-
+fn parseCommandlineArgs(allocator: std.mem.Allocator) !struct { cmd: Cmd, install_zls: bool } {
     var iter = try std.process.ArgIterator.initWithAllocator(allocator);
     defer iter.deinit();
 
@@ -485,7 +466,37 @@ pub fn main() !void {
         }
     }
 
-    switch (cmd) {
+    return .{ .cmd = cmd, .install_zls = install_zls };
+}
+
+fn driver(allocator: std.mem.Allocator) !void {
+    const basepath = try std.process.getEnvVarOwned(allocator, "ZIGUP_BASEDIR");
+    defer allocator.free(basepath);
+
+    if (basepath.len == 0) {
+        std.debug.print("environment is set up incorrectly. add `export ZIGUP_BASEDIR=<path>` to ~/.profile, and check if you source it in your rc file.\n", .{});
+        return error.InvalidEnvSetup;
+    }
+
+    const config_path = try std.mem.join(allocator, "/", &.{ basepath, "config.json" });
+    defer allocator.free(config_path);
+
+    const options = blk: {
+        const s = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 32) catch {
+            std.debug.print("couldn't find config.json at {s}. let's build it\n", .{basepath});
+            const options = try buildOptions(allocator);
+            break :blk options;
+        };
+
+        break :blk (try std.json.parseFromSlice(Options, allocator, s, .{})).value;
+    };
+
+    const task = parseCommandlineArgs(allocator) catch {
+        std.debug.print("invalid args.\n{s}", .{help_string});
+        return error.InvalidArgs;
+    };
+
+    switch (task.cmd) {
         .setup => {
             const dir = try std.fs.cwd().openDir(basepath, .{});
             try dir.makeDir("cache");
@@ -533,7 +544,7 @@ pub fn main() !void {
 
             const version_info = try getVersionInfo(&client, allocator, options, version);
 
-            try installVersion(&client, allocator, options, version_info, basepath, install_zls);
+            try installVersion(&client, allocator, options, version_info, basepath, task.install_zls);
         },
         .use => |version| {
             var client = std.http.Client{ .allocator = allocator };
@@ -542,7 +553,7 @@ pub fn main() !void {
             const version_info = try getVersionInfo(&client, allocator, options, version);
 
             if (!try isInstalled(allocator, version_info, basepath)) {
-                try installVersion(&client, allocator, options, version_info, basepath, install_zls);
+                try installVersion(&client, allocator, options, version_info, basepath, task.install_zls);
             }
 
             const path = try std.fs.path.join(allocator, &.{ basepath, "versions", version_info.shasum });
@@ -562,10 +573,17 @@ pub fn main() !void {
             dir.deleteTree("versions") catch {};
             try dir.makeDir("versions");
         },
-        .help => std.debug.print(
-            \\  Zigup - The minimal zig version manager.
-            \\    [use, install, setup, help, clean] [-zls, ...]
-            \\
-        , .{}),
+        .help => std.debug.print("{s}", .{help_string}),
     }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator()); // std.heap.page_allocator
+
+    // some functions are leaky.
+    const allocator = arena.allocator();
+    defer arena.deinit();
+
+    driver(allocator) catch {};
 }
